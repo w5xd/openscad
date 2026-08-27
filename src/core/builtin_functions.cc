@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <boost/format.hpp>
+#include <boost/math/interpolators/cardinal_cubic_b_spline.hpp>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
@@ -948,6 +949,96 @@ Value builtin_cross(Arguments arguments, const Location& loc)
   return VectorType(arguments.session(), x, y, z);
 }
 
+Value builtin_cubic_spline(Arguments arguments, const Location& loc)
+{ /* A wrapper for boost's cardinal_cubic_b_spline  */
+  if (arguments.size() < 4) {
+    LOG(message_group::Warning, loc, arguments.documentRoot(), "Too few arguments to cubic_spline()");
+    return Value::undefined.clone();
+  }
+
+  // The first 3 args must be NUMBER
+  for (unsigned argc = 0; argc < 3; argc++)
+    if (arguments[argc]->type() != Value::Type::NUMBER) {
+      LOG(message_group::Warning, loc, arguments.documentRoot(),
+          "x0, x1, and n must be numbers for cubic_spline()");
+      return Value::undefined.clone();
+    }
+
+  double x0 = arguments[0]->toDouble();
+  double x1 = arguments[1]->toDouble();
+  if (x0 == x1) {
+    LOG(message_group::Warning, loc, arguments.documentRoot(),
+        "x0 and x1 must be different for cubic_spline()");
+    return Value::undefined.clone();
+  }
+
+  // argument[2] determines the size of the the returned Vector
+  static const unsigned MAX_INTERPOLATED_POINTS = 10000;
+  unsigned nOutputPoints = static_cast<unsigned>(arguments[2]->toDouble());
+  if ((nOutputPoints < 2) || (nOutputPoints > MAX_INTERPOLATED_POINTS)) {
+    LOG(message_group::Warning, loc, arguments.documentRoot(),
+        "Invalid number of interpolated points cubic_spline()");
+    return Value::undefined.clone();
+  }
+
+  const auto& yvalues = arguments[3]->toVector();
+  if (yvalues.size() < 2) {
+    LOG(message_group::Warning, loc, arguments.documentRoot(),
+        "Minimum size of 2 for values vector in cubic_spline()");
+    return Value::undefined.clone();
+  }
+
+  // slopes at left endpoint and right endpoint defaults. Match boost library
+  double le(std::numeric_limits<double>::quiet_NaN()), re(std::numeric_limits<double>::quiet_NaN());
+
+  if (arguments.size() > 4) {
+    le = arguments[4]->toDouble();
+    if (arguments.size() > 5) re = arguments[5]->toDouble();
+  }
+
+  // wrap a boost BidiIterator around VectorType
+  class spline_iterator
+  {
+  private:
+    const VectorType& v;  // VectorType of NUMBER
+    unsigned idx;
+
+  public:
+    spline_iterator(const VectorType& v, bool atBegin = true) : v(v), idx(atBegin ? 0 : v.size()) {}
+    // boost BidiIterator requires these two operators:
+    double operator[](unsigned id) const
+    {
+      if (v[id].type() != Value::Type::NUMBER)
+        throw std::runtime_error("Non-numerc values to cubic_spline");
+      return v[id].toDouble();
+    }
+    int operator-(const spline_iterator& other) const { return idx - other.idx; }
+  };
+  double step = (x1 - x0) / (yvalues.size() - 1);
+  spline_iterator begin(yvalues);
+  spline_iterator end(yvalues, false);
+  try {
+    boost::math::interpolators::cardinal_cubic_b_spline<double> spline(begin, end, x0 /* start time */,
+                                                                       step, le, re);
+    VectorType result(arguments.session());
+    result.reserve(nOutputPoints);
+    auto xrange = x1 - x0;
+    for (unsigned i = 0; i < nOutputPoints; i++) {
+      double x = x0 + (xrange * i) / (nOutputPoints - 1);
+      auto y = spline(x);
+      VectorType point(arguments.session());
+      point.reserve(2);
+      point.emplace_back(x);
+      point.emplace_back(y);
+      result.emplace_back(std::move(point));
+    }
+    return std::move(result);   // successful return
+  } catch (const std::exception& e) {
+    LOG(message_group::Warning, loc, arguments.documentRoot(), std::string("cubic_spline ") + e.what());
+  }
+  return Value::undefined.clone();
+}
+
 Value builtin_textmetrics(Arguments arguments, const Location& loc)
 {
   auto *session = arguments.session();
@@ -1342,4 +1433,9 @@ void register_builtin_functions()
                  {
                    "import(file) -> object",
                  });
+
+  Builtins::init("cubic_spline", new BuiltinFunction(&builtin_cubic_spline),
+              {
+                  "cubic_spline(x0, x1, n, values, s0, s1) -> vector",
+              });
 }
