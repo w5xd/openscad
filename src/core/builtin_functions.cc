@@ -957,10 +957,10 @@ Value builtin_cubic_spline(Arguments arguments, const Location& loc)
   }
 
   // The first 3 args must be NUMBER
-  for (unsigned argc = 0; argc < 3; argc++)
+  for (unsigned argc = 0; argc < 2; argc++)
     if (arguments[argc]->type() != Value::Type::NUMBER) {
       LOG(message_group::Warning, loc, arguments.documentRoot(),
-          "x0, x1, and n must be numbers for cubic_spline()");
+          "x0 and x1 must be numbers for cubic_spline()");
       return Value::undefined.clone();
     }
 
@@ -972,12 +972,37 @@ Value builtin_cubic_spline(Arguments arguments, const Location& loc)
     return Value::undefined.clone();
   }
 
-  // argument[2] determines the size of the the returned Vector
-  static const unsigned MAX_INTERPOLATED_POINTS = 10000;
-  unsigned nOutputPoints = static_cast<unsigned>(arguments[2]->toDouble());
-  if ((nOutputPoints < 2) || (nOutputPoints > MAX_INTERPOLATED_POINTS)) {
+  const auto& nArg = arguments[2];
+  // third argument, n, can either be a number or a list of x values 
+  std::function<double(unsigned)> xFcn;
+  unsigned nOutputPoints(0);
+  auto typeOfn = nArg->type();
+  if (typeOfn == Value::Type::NUMBER) {
+    // caller specified an output of this many equal-spaced x values
+    static const unsigned MAX_INTERPOLATED_POINTS = 10000;
+    // nArg determines the size of the the returned Vector
+    nOutputPoints = static_cast<unsigned>(nArg->toDouble());
+    if ((nOutputPoints < 2) || (nOutputPoints > MAX_INTERPOLATED_POINTS)) {
+      LOG(message_group::Warning, loc, arguments.documentRoot(),
+          "Invalid number of interpolated points cubic_spline()");
+      return Value::undefined.clone();
+    }
+    // equal spaced x values from x0 to x1, inclusive
+    auto xrange = x1 - x0;
+    xFcn = [x0, xrange, nOutputPoints](unsigned i) { return x0 + (xrange * i) / (nOutputPoints - 1); };
+  } else if (typeOfn == Value::Type::VECTOR) {
+    // caller provided a list of explicit x values
+    const auto& xValues = nArg->toVector();
+    nOutputPoints = xValues.size();
+    xFcn = [&xValues](unsigned i) {
+      const auto& val = xValues[i];
+      if (val.type() != Value::Type::NUMBER)
+        throw std::runtime_error("Non-numeric value to cubic_spline");
+      return val.toDouble();
+    };
+  } else {
     LOG(message_group::Warning, loc, arguments.documentRoot(),
-        "Invalid number of interpolated points cubic_spline()");
+        "Parameter n must be either number or vector in cubic_spline()");
     return Value::undefined.clone();
   }
 
@@ -988,7 +1013,7 @@ Value builtin_cubic_spline(Arguments arguments, const Location& loc)
     return Value::undefined.clone();
   }
 
-  // slopes at left endpoint and right endpoint defaults. Match boost library
+  // slopes at left endpoint and right endpoint defaults. Init to boost library defaults
   double le(std::numeric_limits<double>::quiet_NaN()), re(std::numeric_limits<double>::quiet_NaN());
 
   if (arguments.size() > 4) {
@@ -996,43 +1021,43 @@ Value builtin_cubic_spline(Arguments arguments, const Location& loc)
     if (arguments.size() > 5) re = arguments[5]->toDouble();
   }
 
-  // wrap a boost BidiIterator around VectorType
-  class spline_iterator
-  {
+  class spline_iterator // wrap a boost BidiIterator around VectorType
+  {  
   private:
     const VectorType& v;  // VectorType of NUMBER
     unsigned idx;
-
   public:
     spline_iterator(const VectorType& v, bool atBegin = true) : v(v), idx(atBegin ? 0 : v.size()) {}
     // boost BidiIterator requires these two operators:
+    int operator-(const spline_iterator& other) const { return idx - other.idx; }
     double operator[](unsigned id) const
     {
-      if (v[id].type() != Value::Type::NUMBER)
-        throw std::runtime_error("Non-numerc values to cubic_spline");
-      return v[id].toDouble();
+      const auto& val = v[id];
+      if (val.type() != Value::Type::NUMBER)
+        throw std::runtime_error("Non-numeric value to cubic_spline");
+      return val.toDouble();
     }
-    int operator-(const spline_iterator& other) const { return idx - other.idx; }
   };
+
   double step = (x1 - x0) / (yvalues.size() - 1);
   spline_iterator begin(yvalues);
   spline_iterator end(yvalues, false);
   try {
-    boost::math::interpolators::cardinal_cubic_b_spline<double> spline(begin, end, x0 /* start time */,
-                                                                       step, le, re);
+    // after processing all the openscad arguments, we (finally) can calculate
+    boost::math::interpolators::cardinal_cubic_b_spline<double> 
+      spline(begin, end, x0,  step, le, re);
     VectorType result(arguments.session());
     result.reserve(nOutputPoints);
-    auto xrange = x1 - x0;
     for (unsigned i = 0; i < nOutputPoints; i++) {
-      double x = x0 + (xrange * i) / (nOutputPoints - 1);
-      auto y = spline(x);
+      double x = xFcn(i);
+      double y = spline(x);
       VectorType point(arguments.session());
       point.reserve(2);
       point.emplace_back(x);
       point.emplace_back(y);
       result.emplace_back(std::move(point));
     }
-    return std::move(result);   // successful return
+    return std::move(result);  // only successful return
   } catch (const std::exception& e) {
     LOG(message_group::Warning, loc, arguments.documentRoot(), std::string("cubic_spline ") + e.what());
   }
